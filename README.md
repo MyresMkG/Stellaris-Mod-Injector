@@ -1,170 +1,236 @@
-# stellaris_mod_injector —— injected_mods 注入器
+# stellaris_mod_injector_dll_src
 
-把 `injected_mods` 目录里的**所有 DLL** 注入群星主程序的注入器。
+`stellaris_mod_injector.exe` 的**代理 DLL 版**源码：把"启动游戏后注入 injected_mods"
+搬进游戏进程内部 —— 靠顶替一个游戏启动时一定会加载的系统 DLL（`dxgi.dll` / `winmm.dll` /
+`version.dll` / `d3d11.dll` / `d3d9.dll` 五种），加载器就在游戏进程里跑，不需要外部工具。
 
-**它不修改游戏的任何文件**，DLL 只存在于进程内存里；关掉游戏就干净了。
-
-（注：使用deepseek-v4.1-flash编写，harness为Kimi Code）
-
----
-
-## 1. 文件
-
-```
- stellaris_mod_injector.cpp   全部源码（单文件，无第三方依赖）
- build.bat           用 MinGW-w64 编译，产物直接写到 ..\stellaris_mod_injector_bin\
- README.md           本文件
-```
-
-编译（需要 PATH 里有 MinGW-w64 的 `g++`，或设 `MINGW_BIN`）：
-
-```
-build.bat                 rem 产物写到 ..\stellaris_mod_injector_bin\stellaris_mod_injector.exe
-build.bat D:\somewhere    rem 也可以指定别的输出目录
-```
-
-编译参数： `-std=c++17 -O2 -static -static-libgcc -static-libstdc++` ，
-产物不依赖 MinGW 运行库。`-Wall -Wextra` 下无警告。
+成品和面向玩家的说明在 `..\stellaris_mod_injector_dll\`。
 
 ---
 
-## 2. 命令行
+## 1. 目录
 
 ```
-stellaris_mod_injector.exe [options] [-- <游戏参数>]
+stellaris_mod_injector_dll_src/
+├── build.bat                     一键编译五种，产物写到 ..\stellaris_mod_injector_dll\
+├── README.md                     本文件
+├── src/
+│   ├── dllmain.cpp               DllMain（只登记 + 查标志位）+ 延迟启动 + 加载流程
+│   ├── crtprobe.h / crtprobe.cpp 在主 exe 里找"游戏 CRT 是否已经初始化"的标志位
+│   ├── mods.h / mods.cpp         injected_mods 扫描、PE 检查、加载、probe 标记
+│   ├── config.h / config.cpp     可选 ini（delay_ms）
+│   ├── log.h / log.cpp           覆盖式日志（每次启动重写）+ OutputDebugString
+│   └── util.h / util.cpp         路径、UTF-8、Win32 错误文本
+├── def/                          每种名字的导出清单（生成物，别手改，见第 4 节）
+│   ├── dxgi.def  d3d11.def  d3d9.def  version.def  winmm.def
+└── tools/
+    ├── gen_proxy_def.py          从本机 System32 生成 def\<name>.def
+    ├── run_tests.py              编译 + 125 项自动检查（导出表、宿主桩、加载流程、ini、负例）
+    ├── host_stub.cpp             测试宿主：导入游戏实际导入的那些函数，起一条线程并跑消息循环
+    ├── test_mod.cpp              测试 mod：记录自己的 DllMain 跑了几次
+    ├── check_crt_probe.cpp       拿一个真实的游戏 exe 验证 crtprobe 还能找到标志位
+    └── suspended_start_check.cpp 复现启动器的启动方式（进程挂起 + 由别的线程走导入表）
+├── build_out/                    测试编译的产物（run_tests.py 生成，可删）
+└── test_out/                     测试宿主与各用例目录（同上，可删）
 ```
 
-| 参数 | 作用 |
+## 2. 工作原理
+
+1. **冒充**：每种构建都链接 `def/<name>.def`。这个 def 里列着同名系统 DLL 的**全部
+   命名导出和它们的原始序号**，每个都是转发器（forwarder），指向
+   `C:/Windows/System32/<name>.<Func>`。所以进程里任何模块从 `dxgi.dll` 等名字上
+   拿到的东西和真文件一一对应，连序号都对得上（`tools/run_tests.py` 会逐个核对）。
+   转发用正斜杠是因为 GNU ld 的 .def 词法把 `\` 当转义（反斜杠写法会编译失败）。
+2. **DllMain**：只记句柄、查一次标志位、登记一个回调定时器，然后立刻返回。
+   它在 loader lock 里、而且是在游戏自己的导入还没解析完的时候被调用，
+   所以这里不能建线程（1.1 起也不再建，原因见下），也不能干别的。
+3. **延迟启动（1.1）**：`src/crtprobe.cpp` 在主 exe 里找那个"-1 表示还没分配"的
+   TLS 索引变量 —— 它的值是 `-1` 时，游戏自己的 CRT 还处在启动过程中，
+   这时候任何新线程都会被游戏的 TLS 回调送进 `abort()`（0xC0000409 / BEX64）。
+   所以线程只在两处创建：
+   - `DllMain(DLL_THREAD_ATTACH)`：游戏自己起了一条新线程，且标志位说 CRT 好了；
+   - 回调定时器：加载线程进入消息循环（游戏自己的主循环），且标志位说 CRT 好了。
+
+   两条路都晚于游戏自己的启动。真要是都等不到（30 秒），就在当时那条**已经初始化**
+   的线程上直接加载（`start : the CRT stayed unready for ...`）——建线程才危险，
+   在已有线程上跑不危险。找不到标志位（别的宿主、别的 CRT）时退回按时间等
+   （`kNoProbeSafeMs` = 700 ms）那一套。
+4. 线程起来之后：等满 `delay_ms`（默认 700，与注入器 `--delay 700` 同值，起点是进程
+   创建时刻）→ 取一个按 pid 命名的互斥量（玩家装多个名字时只有一个负责加载，
+   其余会看到 "was already loaded in the process"）→ 扫 `injected_mods\*.dll`，
+   按**文件名顺序**（与注入器一致，保证动态关键字注册顺序稳定）→ 与注入器**同一套**
+   PE 检查（是 DLL、x64），坏文件跳过并写明原因 → `LoadLibraryW` 全路径逐个加载，
+   每个都写一行 `ok (module ...)` 或 `FAILED: ...` → 汇总 `N of M DLL(s) loaded`。
+   日志写在**游戏根目录**的 `stellaris_mod_loader.log`（1.1 起；更早的版本写在
+   `injected_mods\` 里，那里也可能有旧文件）—— 和 exe 并排，玩家一眼就能找到，
+   也不受 `injected_mods` 目录是否可写影响。**每次启动覆盖**，文件里只有这一次
+   运行：玩家看的永远是刚才那次，昨天的失败不会再混进来。各个 mod 自己的日志
+   仍写在它们自己旁边（那些是追加的）。
+5. `stellaris_mod_loader_probe.txt` 存在时，会在每个 DLL 旁边生成
+   `diplo_action_hook_probe_only.txt`（= 注入器的 `--probe`）。
+
+### 为什么 DllMain 里不再创建线程（1.1）
+
+1.0 在 DllMain 里立刻 `CreateThread`。当游戏是**直接**启动时，主线程几乎总能先跑到
+CRT 初始化，所以看不出来；但**从启动器启动**时不是这样：Paradox Launcher 拉起的
+进程被创建成挂起状态，`gameoverlayrenderer64.dll`（Steam 覆盖层）挂进去的线程
+替游戏走完导入表 —— 我们那条线程这时也被创建了，而游戏的主线程还没被恢复，
+CRT 初始化根本没机会跑。于是我们线程的 TLS 回调先执行，发现 CRT 的索引还是 `-1`，
+按 CRT 自己的规矩 `abort()`。本机两份崩溃转储里出错线程的起始地址都是
+`dxgi.dll+0x14b0`（加载器线程函数），这是定位的决定性证据。
+
+`tools/suspended_start_check.cpp` 就是把这条启动方式复现成一个工具：进程挂起、
+在它里面起一条线程（让导入表在那条线程上走完），然后看进程还在不在。
+1.0 的产物在这个工具下于主线程被恢复之前就死了，1.1 的产物活着。
+（工具恢复主线程之后的访问违例不算数：那一步**没有任何代理**时也会发生，
+是"导入表由别的线程走完、那条线程又走了"这件事本身带来的，工具的注释里写了。）
+
+### 为什么没有"等加载器空闲"的探测
+
+`LoadLibraryW` 自己会阻塞在 loader lock 上：如果游戏镜像还没初始化完，加载会自然推迟到
+初始化结束，不需要（也不应该）额外探测。这不是理论 —— 试过并测出问题：
+
+本机实验（Windows 10 19045，宿主 = 只导入 dxgi 的最小 exe，命名为 `stellaris.exe`，
+代理用真的 def，只换 DllMain 的行为）：
+
+| 变体 | 结果 |
 | --- | --- |
-| `--exe <路径>` | 指定游戏主程序（默认：自己旁边的 `stellaris.exe` → Steam 库里已安装的那份） |
-| `--mods-dir <路径>` | 指定要扫描的目录（默认：自己旁边的 `injected_mods` → 游戏目录下的 `injected_mods`） |
-| `--dll <路径>` | 额外注入一个指定 DLL，可重复；这些排在被扫出来的 DLL **前面** |
-| `--attach <名字或PID>` | 注入到已经在跑的进程，不启动新的 |
-| `--delay <毫秒>` | 启动后等多久再注入（默认 700，上限 599999） |
-| `--new-instance` | 即使游戏已经在跑也**再开一个**（默认是附加到已在跑的那个） |
-| `--list` | 只打印会注入哪些、哪些被跳过，然后退出；不碰任何进程 |
-| `--probe` | 在每个被注入 DLL 旁边建 `diplo_action_hook_probe_only.txt`，让 diplo 钩子只解析地址不装钩子 |
-| `--wait` | 等目标进程退出 |
-| `--suspend` | ⚠️ 不推荐：挂起启动再注入。实测会让本机 4.5.1 立刻崩在 `0xC0000005`，默认关闭 |
+| 纯转发，DllMain 不起线程 | 正常 |
+| DllMain 起线程，只写日志 | 直接启动正常；**挂起启动崩溃**（见上） |
+| 上面 + `LdrLockLoaderLock(TRY_ONLY)` 轮询探测 | **卡死**：宿主停在 `CreateDXGIFactory1`，探测一直报"锁忙" |
+| 上面改为延迟后 `LoadLibraryW`（不探测） | 正常 |
 
-### 路径解析规则
+也就是说，从"进程初始化期间创建的线程"里去 TRY_ONLY 探测加载器锁，会把加载器锁搞成
+永远拿不到的状态。所以最终版**只保留 delay + 让 LoadLibrary 自己阻塞 + 等 CRT 标志位**，
+并在 `src/dllmain.cpp`、`src/crtprobe.h` 里写明了原因。
 
-1. **游戏**：`--exe` > 自己旁边的 `stellaris.exe` > 注册表 `HKCU\Software\Valve\Steam\SteamPath`
-   加各库的 `libraryfolders.vdf`（`steamapps\libraryfolders.vdf` 与 `config\libraryfolders.vdf`）
-   里能找到的 `steamapps\common\Stellaris\stellaris.exe`。
-2. **DLL 目录**：`--mods-dir` > 自己旁边的 `injected_mods`（存在时）> 游戏目录下的 `injected_mods`。
-   自己推出来的目录如果落在 Windows 系统目录里（`Windows`、`System32`、`SysWOW64`），**直接拒绝**并报错。
+## 3. 编译
 
-### 退出码
+```
+build.bat
+```
 
-| 码 | 含义 |
+需要 MinGW-w64 的 `g++` 在 PATH 里，或设置 `MINGW_BIN`。产物（五种 DLL）写到
+`..\stellaris_mod_injector_dll\`。全部静态链接：产物的导入表只有 `KERNEL32.dll` 和
+UCRT 的 api-ms 集（`ucrtbase.dll`，Windows 10 自带），不依赖 MinGW 运行库。
+
+设 `OUTDIR` 可以编译到别处（`tools\run_tests.py` 就是这么做的，所以跑测试不会
+覆盖已经实机验证过的产物）：
+
+```
+set OUTDIR=D:\tmp\proxy && build.bat
+```
+
+## 4. 重新生成导出清单
+
+System32 里的这些 DLL 换了版本（或系统目录不是 `C:\Windows`）时：
+
+```
+py -3 tools\gen_proxy_def.py
+```
+
+它读每个系统 DLL 的导出表，写出 `def\<name>.def`（名字 + 原序号 + 转发目标），
+并报告"只有序号、没有名字"的导出（这些**无法**转发，会跳过；本机 d3d9 有 6 个、
+winmm 有 1 个，游戏都不按序号用它们）。
+
+## 5. 测试
+
+```
+py -3 tools\run_tests.py            （编译到 build_out\，再跑全部检查）
+py -3 tools\run_tests.py --no-build （只跑检查，用 build_out\ 里现成的产物）
+py -3 tools\run_tests.py --out ..\stellaris_mod_injector_dll --no-build
+                                    （检查已经发布的那些 DLL）
+```
+
+测试自己编译到 `build_out\`，`build.bat` 的产物（`..\stellaris_mod_injector_dll\`）
+不会被碰；两边都存在时会比对 `.text` 段，并注明"发布的 DLL 就是刚测过的这份代码"
+还是"和刚测的这份不是同一份代码"。
+
+125 项检查，全部离线（不碰游戏）：
+
+1. **导出表核对**（每种名字）：名字集合一致、无多余名字、序号一致、每个导出都转发回
+   System32 的真文件；
+2. **宿主桩**：一个导入了"游戏实际导入的那些函数"的 exe，真调用 `GetFileVersionInfoSizeA`
+   （必须拿到真实大小）、`timeGetTime`、`Direct3DCreate9`、`CreateDXGIFactory1`、`D3D11CreateDevice`；
+   转发器解析不了的话它在启动阶段就会失败；
+3. **加载流程**（五种名字各一遍）：测试 mod 被加载且 DllMain 只跑一次、32 位 DLL / 非 PE
+   文件 / MZ 合法但头偏移坏掉的文件被跳过并写明原因、`injected_mods` 里叫 `*.dll` 的**目录**
+   不算候选、loader 自己那份副本被跳过、ini 延迟生效、日志与汇总行正确，
+   且日志写在**游戏根目录**、不再落在 `injected_mods\` 里；
+   另外每种名字都要求 `start :` 行说加载线程是**被消息循环叫醒**的（而不是在挂接时
+   就创建），并且叫醒时刻不早于 ini 里的 `delay_ms`；
+4. **负例**：宿主不是 `stellaris.exe` 时拒绝加载、缺 `injected_mods` 时写指引、
+   三个代理同时装时只加载一遍、probe 标记生成正确；
+5. **启动器那种启动方式**：宿主不跑消息循环、只在 1.2 秒后起一条线程 —— 这时
+   只有 `DLL_THREAD_ATTACH` 能叫醒代理，要求日志写出
+   `start : a thread attached after the CRT was up` 且 mod 照常加载；
+6. **ini 编码**（6 种）：LF / CRLF / 带 BOM 的 UTF-8 / UTF-16LE / UTF-16BE / 带注释与
+   空格，都要求 `delay_ms` 真的生效（2026-09-29 之前，带 BOM 的文件会被静默忽略）；
+7. **ini 里不能用的值**：越界值、拼错的键、没有 `=` 的行，各自要求在日志里写明被忽略、
+   并说明用的是哪个值；
+8. **等满 delay_ms**：一个 `delay_ms=1500` 的用例，要求日志出现 `waiting ... ms`，
+   证明 worker 仍然按玩家配置等待。
+
+### 另外两个不进自动测试的工具
+
+游戏相关的这两件事没法离线做，各配了一个小工具（都在 `tools\` 下，都可以单独编译）：
+
+- `check_crt_probe.cpp` —— 拿一个真实的游戏 exe，验证 `src/crtprobe.cpp` 还能找到
+  那个 CRT 标志位（`found at rva 0x...`；找不到不影响使用，只是退回按时间等的路径）。
+  用法：
+
+  ```
+  g++ -std=c++17 -O2 -o check_crt_probe.exe tools\check_crt_probe.cpp src\crtprobe.cpp
+  check_crt_probe.exe "D:\SteamLibrary\steamapps\common\Stellaris\stellaris.exe"
+  ```
+
+- `suspended_start_check.cpp` —— 复现启动器的启动方式（进程挂起，导入表由另一条线程
+  走完），看代理会不会在那之前就创建线程而把游戏弄死。判定看
+  `process still alive after N s` 这一行；工具里也写明了恢复主线程之后的访问违例
+  与代理无关（没有任何代理时同样发生）。用法：
+
+  ```
+  g++ -std=c++17 -O2 -o suspended_start_check.exe tools\suspended_start_check.cpp
+  suspended_start_check.exe "D:\SteamLibrary\steamapps\common\Stellaris\stellaris.exe" 8
+  ```
+
+### 实机验证
+
+真游戏 4.5.1（本机 Steam 版）+ `injected_mods` 里的 3 个 mod
+（`achievement_unlocker.dll` / `diplo_action_hook.dll` / `sound_ogg_hook.dll`）：
+
+- **1.0**：`dxgi.dll` 与 `d3d11.dll` 各跑一遍，两种都是**直接**启动：
+  代理在 704 / 641 ms 内把 3 个 DLL 全部加载，`diplo_action_hook` 在 1.8 s 装好钩子，
+  60 s 数据加载完后自检全过。原始日志：`..\stellaris_mod_injector_dll\验证日志_实机_loader.log`。
+  **从启动器启动时同一份代码必定崩**（两份 0xc0000409 崩溃转储，出错线程是加载器自己的
+  线程函数 `dxgi.dll+0x14b0`；Steam 日志显示那两次是 `dowser.exe` 拉起的游戏）。
+- **1.1**：`dxgi.dll` 直接启动跑通（`验证日志_实机_1.1_延迟启动.log`）：
+  `crt   : ... ready`、`start : a thread attached after the CRT was up (650 ms)`、
+  满 700 ms 后加载 3 个 mod，游戏正常到主菜单、三个 mod 的日志都正常
+  （diplo 的自检全过、拿到新 token）。
+  启动器那条路用 `suspended_start_check.cpp` 验证：1.0 的产物在导入表走完之前就死，
+  1.1 的产物活着（`process still alive after 8 s`）。
+
+### 没有验证的部分
+
+- `version.dll` / `winmm.dll` 没有在实机上装载过：这两个名字在本机游戏目录里被整合版的
+  Steam 模拟器占着，装上去会顶掉它，所以只做了离线验证（导出表 + 宿主桩 + 加载流程）；
+- 真实启动器（Paradox Launcher 点 Play）下的 1.1 端到端跑一遍还没做：那条路只能用
+  `suspended_start_check.cpp` 复现到"导入表走完时进程还活着"这一步（见上），
+  恢复主线程之后这一步是工具自己的构造限制，换真正启动器不会有；
+- 多人游戏（动态 token 的联机一致性是 diplo 钩子自己的问题，与加载方式无关）；
+- Windows 11 与"系统目录不是 `C:\Windows`"的机器（转发目标写死在 def 里）；
+- d3d9 的 6 个仅序号导出（没有名字，无法转发）；
+- 其它版本的游戏（代理机制与版本无关，但"哪个名字、多早加载"、以及 CRT 标志位的
+  形状是按 4.5.1 核的；换了 CRT 就用 `check_crt_probe.cpp` 重新确认）。
+
+## 6. 与注入器的行为差异
+
+| 注入器（外部） | 本 DLL 版（进程内） |
 | --- | --- |
-| 0 | 全部注进去了（`--list` 时表示"有东西可注"） |
-| 1 | 参数/路径错误、没有可注入的 DLL、有 DLL 注入失败，或目标进程在注入前就退出了 |
+| `CreateProcess` 后等 700 ms，再远程 `LoadLibraryW` | 进程创建后等 700 ms，进程内 `LoadLibraryW` |
+| `--delay` / `--probe` / `--attach` / `--wait` / `--new-instance` / `--list` | ini `delay_ms` / 标记文件 / 不适用 / 不适用 / 不适用 / 日志里的 `[skip]`+`loading` 行 |
+| 注入失败会打印错误并保留窗口 | 写日志，游戏继续跑 |
+| 需要玩家每次双击 | 随游戏启动自动生效 |
 
----
-
-## 3. 实现要点
-
-- **扫描**：`FindFirstFileW(mods\*)` 取所有 `*.dll`（大小写不敏感），按文件名排序，
-  所以每次注入顺序都一样；`--dll` 指定的排在前面。同名路径按整路径去重。
-- **路径先转绝对**：`--dll` / `--mods-dir` / `--exe` 的相对写法先用 `GetFullPathNameW`
-  转成绝对路径，再校验、再注入。本工具校验文件用的是自己的工作目录，而被注入进程
-  解析 `LoadLibraryW` 用的是它自己的工作目录（启动模式下是游戏目录），两者不一定
-  相同——不转绝对就会出现"校验的是 A、加载的是 B"。
-- **参数原样转发**：`--` 后面的参数按 `CommandLineToArgvW` 的规则重新加引号后再拼进
-  命令行，所以带空格、带引号、结尾带反斜杠的单个参数，到达被启动程序时仍是同一个参数。
-- **校验**：读每个文件的 DOS/NT 头，要求有 `MZ`、`PE\0\0`、`IMAGE_FILE_DLL`，
-  且 `Machine == 0x8664`。不合格的直接列成 `[skip] <名字>: <原因>`，不参与注入，
-  也不会让整批失败。这一步在**启动游戏之前**跑完，所以目录里全是坏 DLL 时不会白开一次游戏。
-- **注入**：`VirtualAllocEx` 写入 UTF-16 全路径 → `CreateRemoteThread` 跑目标进程里的
-  `LoadLibraryW` → 等线程结束 → 读返回值（模块句柄）→ 释放远端内存。
-  `LoadLibraryW` 在系统 DLL 共享 ASLR 基址的前提下，本地地址就等于目标进程里的地址。
-  返回值是 32 位的（`GetExitCodeThread` 只给 DWORD），所以读到 0 时还会用
-  `TH32CS_SNAPMODULE` 快照按完整路径复查一次，避免把"其实注进去了"误报成失败。
-- **已加载**：注入前会根据模块快照报告"was already loaded in the target"——已加载的模块
-  `LoadLibraryW` 直接返回旧句柄、`DllMain` **不会**再跑一次，这一点在日志里说清楚，
-  免得看到"注进去了但没效果"无从下手。
-- **目标已退出**：任何 `VirtualAllocEx`/`CreateRemoteThread` 失败都用 `GetExitCodeProcess`
-  复查一次；进程其实已经死了就报告它的退出码并停止注入剩下的 DLL，而不是抛出费解的
-  `error 5 (拒绝访问)`。
-- **已经在跑的游戏**：用 `TH32CS_SNAPPROCESS` 按 exe 名找（如 `stellaris.exe`），
-  找到就 `OpenProcess` 附加，并提示"数据可能已经加载过，早期钩子可能错过"。
-  `OpenProcess` 的权限里包含 `SYNCHRONIZE`，否则 `--wait` 会立刻返回、
-  `GetExitCodeProcess` 只能读到 `259 (STILL_ACTIVE)`。
-- **出错或跳过了 DLL 时不会闪退，并且把原因再列一遍**：全部注入成功、也没有 DLL 被跳过
-  时照旧立刻退出、不等任何按键（`--wait` 也仍然等目标进程退出）。但只要 ① 退出码非 0，
-  或 ② 有 DLL 被 PE 校验筛掉（32 位、不是 PE、文件不存在……），并且本进程有自己的控制台
-  窗口、标准输入又确实是这个控制台（双击 exe 的典型情况），就会先在末尾把原因汇总重印
-  一遍——退出码非 0 时标题是 `1 problem:` / `N problems:`，只是跳过了 DLL 时是
-  `1 warning:` / `N warnings:`，下面每条写成 `  * <原因>`——再打印
-  `press Enter to close this window (exit code N)` 停下等回车。被跳过的 DLL 意味着那个
-  mod 根本没进游戏，一闪而过的窗口最容易漏掉它。标准输入是管道或文件时（脚本、重定向）
-  不重印也不等，免得把自动化卡住。
-- **UTF-16 全程**：路径、命令行、注册表读取、`_wfopen` 都是宽字符，中文目录可用。
-
----
-
-## 4. 验证记录（2026-09-25）
-
-| 用例 | 做法 | 结果 |
-| --- | --- | --- |
-| 扫描与校验 | `--list`，目录里放 3 个好 DLL + 1 个文本冒充的 `broken.dll` + 1 个 32 位 `version.dll` | 3 个列出；两个坏的分辨报 `file is too small to be a PE image` / `not an x64 DLL (machine 0x014c...)`；退出码 0 |
-| 批量注入（启动模式） | `--exe notepad.exe --mods-dir <测试目录> --new-instance` | `3 of 3 DLL(s) injected`；两个探针 DLL 的加载标记都生成，diplo 钩子日志生成 |
-| 批量注入（附加模式） | `--attach notepad.exe` | `3 of 3` 成功，并正确标注三个都是 "was already loaded in the target" |
-| 目标提前退出 | 注入一个开局即退出的目标 | 报 `the process had already exited with code ...`，不再是 `error 5` |
-| `--probe` | `--attach notepad.exe --probe` | 在 DLL 所在目录建出 `diplo_action_hook_probe_only.txt` |
-| 游戏目录默认解析 | 注入器放在游戏根目录，直接 `--list` | `game` = 同级 `stellaris.exe`，`mods` = 同级 `injected_mods`，列出 `diplo_action_hook.dll` |
-| 远离游戏目录 | 在源码树外的目录里 `--list` | 经 Steam 注册表找到 `D:\SteamLibrary\...\stellaris.exe`，DLL 目录回落到游戏目录下的 `injected_mods` |
-| 真实游戏（关键） | 注入器放游戏根目录、`injected_mods\diplo_action_hook.dll`，无参数运行 | 钩子在 t=1.0 s 装好；t≈63 s `registered keyword 'action_plnmg_test' -> token 66908`；`catch-up: scanned 69 action types`；`self-test: OK`；游戏存活 |
-| 原始症状消失 | 同一局结束后的 `Documents\...\Stellaris\logs\error.log` | `Diplomatic action is missing token` 出现 **0** 次 |
-| 中文路径 + 大写扩展名 | 目录 `...\Temp\注入测试\injected_mods\`，放 `probe_c.dll` 与 `UPPER.DLL` | 两个都列出并注入成功，两个标记文件都生成 |
-| 游戏参数转发 | `--exe cmd.exe --new-instance -- //c md <新目录>` | 目录被创建，说明 `--` 后面的参数原样传给了被启动的程序 |
-| `--delay` | `--delay 1500` | 打印 `waiting 1500 ms before injecting` |
-| 参数错误 | 给一个不存在的参数 | 打印 `unknown argument: ...` 与完整用法，退出码 1 |
-| 可重复编译 | 从本目录 `build.bat` 重新编译后与已发布的 exe 逐字节比较 | 734969 字节里只有 3 个字节不同（链接器写入的时间戳/Rich 头），代码段完全一致 |
-| 改名后重跑 | 工具改名为 `stellaris_mod_injector.exe` 后重新编译，游戏根目录再跑一次 | 钩子 t=1.1 s 装好、`registered keyword` / `catch-up: scanned 69` / `self-test: OK` 全部如前，游戏存活 |
-| **注入后自动关闭** | 无参数运行，stdin 指向一条 300 秒不关闭也不发数据的管道（若在等回车就会一直卡着） | 探针目标 **968 ms** 自行退出、退出码 0，探针 DLL 的加载标记已生成；游戏根目录同样 **982 ms** 退出（成功路径；出错时的行为见下一行） |
-| **出错或跳过了 DLL 时不再闪退，并列出原因**（2026-09-26 改动） | 五种组合：成功/出错/只是跳过 × 有自己的控制台窗口/标准输入是管道。做法：`CreateProcess(..., CREATE_NEW_CONSOLE)` 起它，再用 `cmd /c "... > out.txt"` 在它自己那个控制台里跑一次，把屏幕内容读回来 | 出错+控制台 → 末尾把原因汇总重印一遍（`1 problem:`），再停在 `press Enter to close this window (exit code 1)`；**跳过 DLL+控制台 → 同样停下，标题写 `1 warning:`、退出码仍是 0**；跳过+管道 → **131 ms** 自行退出、退出码 0，输出里没有汇总；干净运行（无错无跳过）→ 控制台/管道两种情况都自行退出（**128 ms**，退出码 0）；出错+管道 → **133 ms** 自行退出、退出码 1。汇总覆盖：参数错、找不到游戏、目录里没有可注入 DLL、被跳过的 DLL、逐个 DLL 注入失败、目标提前退出、`--wait`/`ResumeThread` 失败 |
-
-| **`Narrow()` 的越界写法**（2026-09-29 改动） | `std::string out(n - 1, '\0')` 之后又按 `n` 字节转换，最后一个 `'\0'` 落在 `data()[size()]` 上——C++11 起规定这个字节不得被修改（技术上 UB，各家实现上都还没出事）。改成先按 `n` 建串、转换完 `resize(n - 1)` | 行为不变（写进去的本来就是 `'\0'`）。改完重新编译：把这一处还原再编一份，还原版的 `.text` 与发布版 exe **逐字节相同**——说明发布版确实来自这份源码，这次改动也只动了这一处代码 |
-
-出错时屏幕末尾实际长这样（一次批量注入里有 1 个 DLL 加载失败）：
-
-```
-injecting [1/2] bad_init.dll ... FAILED: error 1114 (动态链接库(DLL)初始化例程失败。)
-injecting [2/2] diplo_action_hook.dll ... ok (module 00000000e6ad0000)
-
-1 of 2 DLL(s) injected into pid 68848
-failed:
-  bad_init.dll: error 1114 (动态链接库(DLL)初始化例程失败。)
-
-1 problem:
-  * bad_init.dll: error 1114 (动态链接库(DLL)初始化例程失败。)
-
-press Enter to close this window (exit code 1)
-```
-
-只是有 DLL 被跳过、其它都成功时（退出码 0）长这样：
-
-```
-1 of 1 DLL(s) injected into pid 65328
-
-1 warning:
-  * skipped broken.dll: file is too small to be a PE image
-
-press Enter to close this window (exit code 0)
-```
-
-游戏内的完整日志见发行版的 `使用说明.md` 第 4 节。
-
----
-
-## 5. 已知限制
-
-| 限制 | 说明 |
-| --- | --- |
-| 依赖 `LoadLibraryW` 的地址跨进程一致 | 与 x64 Windows 上系统 DLL 共享基址的既有做法一致；同一个会话内成立 |
-| 不解析 DLL 的依赖目录 | 被注入 DLL 的同目录兄弟依赖，靠"**同目录所有 DLL 都会被注入**"来满足，顺序按文件名；对顺序敏感的场景用 `--dll` 明确排前面 |
-| 无签名/兼容性检查 | 只校验 PE 头与机器类型，不校验版本或签名；钩子本身都是失败即放弃 |
-| 不保证宿主进程的 DLL 顺序 | 注入顺序确定，但每个 DLL 自己的初始化线程由它自己决定 |
+两者可以共存：`LoadLibrary` 对已加载模块返回旧句柄，`DllMain` 不会跑第二次。
