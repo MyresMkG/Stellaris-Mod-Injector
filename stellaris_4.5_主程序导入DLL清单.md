@@ -60,10 +60,6 @@
 `OLEAUT32`、`ADVAPI32`、`bcrypt`、`WS2_32`、`SHLWAPI`、`IMM32`）都在 KnownDLLs 里，
 放同名文件会被忽略。
 
-> ⚠ 本机游戏目录里 `version.dll` 和 `winmm.dll` 已被整合版（Juij）的 Steam 模拟器占用
-> （与 `Juij_Steam.dll` 同内容的三份副本）；`steam_api64.dll` / `PDXSDK.dll` /
-> `nakama-sdk.dll` 是游戏自己的文件。实际挑名字时要避开这些。
-
 ## 2. 实测结果（本机 Windows 10 19045）
 
 方法：假 DLL（每个只导出一个函数）+ 逐名导入的 stub exe，同目录运行，
@@ -127,14 +123,3 @@ SHCORE.dll        ole32.dll        clbcatq.dll      （另有 KnownDllPath：路
 枚举对象管理器里的 `\KnownDlls`）。**不要只看注册表**
 `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs`——注册表视图不含
 `bcrypt.dll`、`cfgmgr32.dll`、`shcore.dll` 等，照它判断会得出错误结论。
-
-## 6. 附 D：复现用到的工具
-
-| 文件 | 用途 |
-| --- | --- |
-| `analysis\pe_dll_check.py` | 解析 exe 的导入表/延迟导入/清单/字符串，并给每个模块名打"可否顶替"判定 |
-| `analysis\exe_imports_full.txt` | 23 个模块的**完整导入函数清单**（写代理转发时照抄） |
-| `analysis\exe_dll_strings.txt` | exe 里出现的所有 `*.dll` 字符串（含运行时动态加载的名字） |
-| `analysis\known_dlls_enum.ps1` | 枚举加载器真正使用的 `\KnownDlls` 对象目录 |
-| `analysis\hijack_test\` | 实机抢占测试（`make.py` + `targets*.tsv`，结果在 `run*\result.txt`） |
-| `analysis\dll_string_context.py` | 查某个 DLL 名字在 exe 里的引用上下文（判断是导入表条目还是运行时 `LoadLibrary`） |
