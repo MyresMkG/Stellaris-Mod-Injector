@@ -100,7 +100,7 @@ def main():
         i = args.index('--system32')
         sys32 = args[i + 1]
         del args[i:i + 2]
-    names = args or ['dxgi', 'winmm', 'version', 'd3d11', 'd3d9']
+    names = args or ['dxgi', 'winmm', 'version', 'd3d11', 'd3dcompiler_47']
 
     os.makedirs(DEF_DIR, exist_ok=True)
     for name in names:

@@ -2,9 +2,11 @@
 
 `stellaris_mod_injector.exe` 的**代理 DLL 版**源码：把"启动游戏后注入 injected_mods"
 搬进游戏进程内部 —— 靠顶替一个游戏启动时一定会加载的系统 DLL（`dxgi.dll` / `winmm.dll` /
-`version.dll` / `d3d11.dll` / `d3d9.dll` 五种），加载器就在游戏进程里跑，不需要外部工具。
+`version.dll` / `d3d11.dll` / `d3dcompiler_47.dll` 五种），加载器就在游戏进程里跑，
+不需要外部工具。
 
-成品和面向玩家的说明在 `..\stellaris_mod_injector_dll\`。
+（初版由deepseek-v4.1-flash编写，harness为kimi code）
+（新版由gpt-6.1-sol编写，harness为codex）
 
 ---
 
@@ -14,18 +16,19 @@
 stellaris_mod_injector_dll_src/
 ├── build.bat                     一键编译五种，产物写到 ..\stellaris_mod_injector_dll\
 ├── README.md                     本文件
+├── stellaris_mod_injector.ini     全默认配置模板（delay_ms=700、probe=0）
 ├── src/
 │   ├── dllmain.cpp               DllMain（只登记 + 查标志位）+ 延迟启动 + 加载流程
 │   ├── crtprobe.h / crtprobe.cpp 在主 exe 里找"游戏 CRT 是否已经初始化"的标志位
 │   ├── mods.h / mods.cpp         injected_mods 扫描、PE 检查、加载、probe 标记
-│   ├── config.h / config.cpp     可选 ini（delay_ms）
+│   ├── config.h / config.cpp     默认 ini 自动创建、读取（delay_ms、probe）
 │   ├── log.h / log.cpp           覆盖式日志（每次启动重写）+ OutputDebugString
 │   └── util.h / util.cpp         路径、UTF-8、Win32 错误文本
 ├── def/                          每种名字的导出清单（生成物，别手改，见第 4 节）
-│   ├── dxgi.def  d3d11.def  d3d9.def  version.def  winmm.def
+│   ├── dxgi.def  d3d11.def  version.def  winmm.def  d3dcompiler_47.def
 └── tools/
     ├── gen_proxy_def.py          从本机 System32 生成 def\<name>.def
-    ├── run_tests.py              编译 + 125 项自动检查（导出表、宿主桩、加载流程、ini、负例）
+    ├── run_tests.py              编译 + 自动检查（导出表、宿主桩、扫描层级、加载流程、ini、负例）
     ├── host_stub.cpp             测试宿主：导入游戏实际导入的那些函数，起一条线程并跑消息循环
     ├── test_mod.cpp              测试 mod：记录自己的 DllMain 跑了几次
     ├── check_crt_probe.cpp       拿一个真实的游戏 exe 验证 crtprobe 还能找到标志位
@@ -55,19 +58,48 @@ stellaris_mod_injector_dll_src/
    的线程上直接加载（`start : the CRT stayed unready for ...`）——建线程才危险，
    在已有线程上跑不危险。找不到标志位（别的宿主、别的 CRT）时退回按时间等
    （`kNoProbeSafeMs` = 700 ms）那一套。
-4. 线程起来之后：等满 `delay_ms`（默认 700，与注入器 `--delay 700` 同值，起点是进程
+4. 线程起来之后：检查游戏根目录的 `injected_mods`，不存在时先新建这个目录，
+   然后打开 `injected_mods\stellaris_mod_injector.log`，检查
+   `injected_mods\stellaris_mod_injector.ini`：缺失时新建全默认配置，已有文件保留，
+   再读取配置。等满 `delay_ms`（默认 700，与注入器
+   `--delay 700` 同值，起点是进程
    创建时刻）→ 取一个按 pid 命名的互斥量（玩家装多个名字时只有一个负责加载，
-   其余会看到 "was already loaded in the process"）→ 扫 `injected_mods\*.dll`，
-   按**文件名顺序**（与注入器一致，保证动态关键字注册顺序稳定）→ 与注入器**同一套**
+   其余会看到 "was already loaded in the process"）→ 只扫 `injected_mods` 的**一层子目录**
+   中的 DLL，例如 `injected_mods\my_mod\hook.dll`；忽略 `injected_mods\hook.dll`，
+   也不进入 `injected_mods\my_mod\deeper\`。汇总后按**文件名顺序**（同名时按完整路径，
+   保证动态关键字注册顺序稳定）→ 检查每个 DLL 同目录是否有对应的
+   `<DLL文件名>noinject` 文件（例如 `hook.dllnoinject`），有则跳过该 DLL → 与注入器**同一套**
    PE 检查（是 DLL、x64），坏文件跳过并写明原因 → `LoadLibraryW` 全路径逐个加载，
    每个都写一行 `ok (module ...)` 或 `FAILED: ...` → 汇总 `N of M DLL(s) loaded`。
-   日志写在**游戏根目录**的 `stellaris_mod_loader.log`（1.1 起；更早的版本写在
-   `injected_mods\` 里，那里也可能有旧文件）—— 和 exe 并排，玩家一眼就能找到，
-   也不受 `injected_mods` 目录是否可写影响。**每次启动覆盖**，文件里只有这一次
+   日志写在**游戏根目录下**的 `injected_mods\stellaris_mod_injector.log`，
+   打开日志前已经完成目录检查和创建。旧文件可能仍在游戏根目录或 `injected_mods\`
+   里，新版不会使用它们。**每次启动覆盖**，文件里只有这一次
    运行：玩家看的永远是刚才那次，昨天的失败不会再混进来。各个 mod 自己的日志
    仍写在它们自己旁边（那些是追加的）。
-5. `stellaris_mod_loader_probe.txt` 存在时，会在每个 DLL 旁边生成
-   `diplo_action_hook_probe_only.txt`（= 注入器的 `--probe`）。
+   **禁用单个 DLL**：在 `injected_mods\my_mod\hook.dll` 旁放一个空文件
+   `hook.dllnoinject`。标记内容不限，只影响同目录同名 DLL；同名目录不算标记。
+   原来的 `hook.dllnoload` 不再识别。
+   检查在打开 DLL、PE 检查和 probe 标记处理之前完成，日志会写
+   `[skip] hook.dll: disabled by hook.dllnoinject`。删除标记后，下次启动恢复加载；
+   不会卸载已经加载的 DLL，也不能阻止其他模块自行加载它。
+
+5. 配置放在 `injected_mods\stellaris_mod_injector.ini`，旧名
+   `stellaris_mod_loader.ini` 不再读取。当前所有 ini 参数及默认值为：
+
+   ```ini
+   delay_ms=700
+   probe=0
+   ```
+
+   `delay_ms` 表示从进程创建到加载 mod 至少等待的毫秒数，有效范围为 1～599999。
+   `probe=0` 默认关闭探测模式，`probe=1` 开启（= 注入器的 `--probe`）。开启时，
+   在每个可加载 DLL 旁生成 `diplo_action_hook_probe_only.txt`，支持这个标记的 mod
+   只解析地址、不安装钩子。关闭时，在加载 DLL 之前删除它旁边已有的这个标记，
+   让上次开启 probe 留下的文件不再生效。
+   `injected_mods\stellaris_mod_loader_probe.txt` 不再用于控制探测模式。
+   缺少参数或参数值无效时使用默认值；`probe` 只接受 `0` 或 `1`。
+   编译会附带全默认 ini。游戏运行时先检查并尝试创建缺失的 `injected_mods`，
+   随后为缺失的 ini 创建默认配置，不改写已有 ini。
 
 ### 为什么 DllMain 里不再创建线程（1.1）
 
@@ -111,7 +143,10 @@ build.bat
 ```
 
 需要 MinGW-w64 的 `g++` 在 PATH 里，或设置 `MINGW_BIN`。产物（五种 DLL）写到
-`..\stellaris_mod_injector_dll\`。全部静态链接：产物的导入表只有 `KERNEL32.dll` 和
+`..\stellaris_mod_injector_dll\`，同时将默认模板复制到产物目录下的
+`injected_mods\stellaris_mod_injector.ini`（每次编译覆盖产物目录中的这份配置）。
+安装时将选用的代理 DLL 放在游戏根目录，并将附带的 `injected_mods` 目录合并到
+游戏根目录；mod DLL 放进 `injected_mods` 的一层子目录中。全部静态链接：产物的导入表只有 `KERNEL32.dll` 和
 UCRT 的 api-ms 集（`ucrtbase.dll`，Windows 10 自带），不依赖 MinGW 运行库。
 
 设 `OUTDIR` 可以编译到别处（`tools\run_tests.py` 就是这么做的，所以跑测试不会
@@ -130,8 +165,8 @@ py -3 tools\gen_proxy_def.py
 ```
 
 它读每个系统 DLL 的导出表，写出 `def\<name>.def`（名字 + 原序号 + 转发目标），
-并报告"只有序号、没有名字"的导出（这些**无法**转发，会跳过；本机 d3d9 有 6 个、
-winmm 有 1 个，游戏都不按序号用它们）。
+并报告"只有序号、没有名字"的导出（这些**无法**转发，会跳过；本机 winmm 有 1 个，
+游戏不按序号用它）。
 
 ## 5. 测试
 
@@ -146,26 +181,34 @@ py -3 tools\run_tests.py --out ..\stellaris_mod_injector_dll --no-build
 不会被碰；两边都存在时会比对 `.text` 段，并注明"发布的 DLL 就是刚测过的这份代码"
 还是"和刚测的这份不是同一份代码"。
 
-125 项检查，全部离线（不碰游戏）：
+自动检查全部离线（不碰游戏）：
 
 1. **导出表核对**（每种名字）：名字集合一致、无多余名字、序号一致、每个导出都转发回
    System32 的真文件；
 2. **宿主桩**：一个导入了"游戏实际导入的那些函数"的 exe，真调用 `GetFileVersionInfoSizeA`
-   （必须拿到真实大小）、`timeGetTime`、`Direct3DCreate9`、`CreateDXGIFactory1`、`D3D11CreateDevice`；
+   （必须拿到真实大小）、`timeGetTime`、`CreateDXGIFactory1`、`D3D11CreateDevice`，
+   并用 `D3DCompile` 真编译一段 HLSL（编译失败即判失败）；
    转发器解析不了的话它在启动阶段就会失败；
 3. **加载流程**（五种名字各一遍）：测试 mod 被加载且 DllMain 只跑一次、32 位 DLL / 非 PE
-   文件 / MZ 合法但头偏移坏掉的文件被跳过并写明原因、`injected_mods` 里叫 `*.dll` 的**目录**
+   文件 / MZ 合法但头偏移坏掉的文件被跳过并写明原因、mod 子目录里叫 `*.dll` 的**目录**
    不算候选、loader 自己那份副本被跳过、ini 延迟生效、日志与汇总行正确，
-   且日志写在**游戏根目录**、不再落在 `injected_mods\` 里；
+   且日志写在 `injected_mods\stellaris_mod_injector.log`、不在游戏根目录生成日志；
+   另对五种代理分别验证只加载一层子目录的 DLL、忽略根层及更深层 DLL，
+   多个子目录一起扫描、大小写扩展名识别和文件名排序正确；
    另外每种名字都要求 `start :` 行说加载线程是**被消息循环叫醒**的（而不是在挂接时
    就创建），并且叫醒时刻不早于 ini 里的 `delay_ms`；
-4. **负例**：宿主不是 `stellaris.exe` 时拒绝加载、缺 `injected_mods` 时写指引、
-   三个代理同时装时只加载一遍、probe 标记生成正确；
+4. **目录和配置**：五种代理及三个代理同时装时，缺 `injected_mods` 会先创建目录、
+   再写日志并补齐默认 ini；已有目录但没有 ini 时同样自动生成，已有配置保留；
+   同名路径被文件占用时保留文件且宿主继续运行；运行时生成的默认 ini 与编译附带
+   的 ini 一致（700 ms、probe 关闭），新 ini 存在时旧名配置不参与读取；
+   **负例**：宿主不是 `stellaris.exe` 时拒绝加载、三个代理同时装时只加载一遍、
+   `probe=1` 在 mod 的 DllMain 运行前生成标记，切回 `probe=0` 在加载前清理标记，
+   旧的 loader probe 标记不再生效；
 5. **启动器那种启动方式**：宿主不跑消息循环、只在 1.2 秒后起一条线程 —— 这时
    只有 `DLL_THREAD_ATTACH` 能叫醒代理，要求日志写出
    `start : a thread attached after the CRT was up` 且 mod 照常加载；
 6. **ini 编码**（6 种）：LF / CRLF / 带 BOM 的 UTF-8 / UTF-16LE / UTF-16BE / 带注释与
-   空格，都要求 `delay_ms` 真的生效（2026-09-29 之前，带 BOM 的文件会被静默忽略）；
+   空格，都要求 `delay_ms` 和 `probe` 真的生效（2026-09-29 之前，带 BOM 的文件会被静默忽略）；
 7. **ini 里不能用的值**：越界值、拼错的键、没有 `=` 的行，各自要求在日志里写明被忽略、
    并说明用的是哪个值；
 8. **等满 delay_ms**：一个 `delay_ms=1500` 的用例，要求日志出现 `waiting ... ms`，
@@ -215,12 +258,14 @@ py -3 tools\run_tests.py --out ..\stellaris_mod_injector_dll --no-build
 
 - `version.dll` / `winmm.dll` 没有在实机上装载过：这两个名字在本机游戏目录里被整合版的
   Steam 模拟器占着，装上去会顶掉它，所以只做了离线验证（导出表 + 宿主桩 + 加载流程）；
+- `d3dcompiler_47.dll` 也还没有在实机上装载过：它的离线验证全过了（导出表 29 个名字、
+  宿主桩真编译一段 HLSL、加载流程按名字各跑一遍），导入表分析与抢占测试里它排在第 4 个、
+  可以从游戏目录顶替，但还没有在真游戏里装载过一遍；
 - 真实启动器（Paradox Launcher 点 Play）下的 1.1 端到端跑一遍还没做：那条路只能用
   `suspended_start_check.cpp` 复现到"导入表走完时进程还活着"这一步（见上），
   恢复主线程之后这一步是工具自己的构造限制，换真正启动器不会有；
 - 多人游戏（动态 token 的联机一致性是 diplo 钩子自己的问题，与加载方式无关）；
 - Windows 11 与"系统目录不是 `C:\Windows`"的机器（转发目标写死在 def 里）；
-- d3d9 的 6 个仅序号导出（没有名字，无法转发）；
 - 其它版本的游戏（代理机制与版本无关，但"哪个名字、多早加载"、以及 CRT 标志位的
   形状是按 4.5.1 核的；换了 CRT 就用 `check_crt_probe.cpp` 重新确认）。
 
@@ -229,7 +274,7 @@ py -3 tools\run_tests.py --out ..\stellaris_mod_injector_dll --no-build
 | 注入器（外部） | 本 DLL 版（进程内） |
 | --- | --- |
 | `CreateProcess` 后等 700 ms，再远程 `LoadLibraryW` | 进程创建后等 700 ms，进程内 `LoadLibraryW` |
-| `--delay` / `--probe` / `--attach` / `--wait` / `--new-instance` / `--list` | ini `delay_ms` / 标记文件 / 不适用 / 不适用 / 不适用 / 日志里的 `[skip]`+`loading` 行 |
+| `--delay` / `--probe` / `--attach` / `--wait` / `--new-instance` / `--list` | ini `delay_ms` / ini `probe` / 不适用 / 不适用 / 不适用 / 日志里的 `[skip]`+`loading` 行 |
 | 注入失败会打印错误并保留窗口 | 写日志，游戏继续跑 |
 | 需要玩家每次双击 | 随游戏启动自动生效 |
 

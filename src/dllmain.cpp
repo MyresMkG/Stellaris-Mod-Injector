@@ -1,12 +1,11 @@
-// Entry point of the five proxy DLLs.
+// Entry point of the proxy DLLs.
 //
 // Every build is linked against def/<name>.def, which forwards each export to
 // the real system DLL in System32 -- as far as the rest of the game process is
 // concerned this file *is* that DLL, down to the ordinals. DllMain adds one
-// thing on top: it loads every DLL from <game root>\injected_mods into the
-// process, the same set stellaris_mod_injector.exe would have injected from the
-// outside, with the same checks, the same file-name order and the same log
-// shape.
+// thing on top: it loads DLLs from immediate child directories of
+// <game root>\injected_mods into the process, with the same checks, file-name
+// order and log shape as stellaris_mod_injector.exe.
 //
 // Why the work happens on a thread: DllMain runs under the loader lock, and this
 // DLL is loaded *while* the game's own imports are still being resolved, so
@@ -78,9 +77,8 @@ volatile LONG g_started = 0;  // the worker was started (or is running inline)
 
 const wchar_t* kGameExeName = L"stellaris.exe";
 const wchar_t* kModsDirName = L"injected_mods";
-const wchar_t* kLogName = L"stellaris_mod_loader.log";
-const wchar_t* kIniName = L"stellaris_mod_loader.ini";
-const wchar_t* kProbeMarkerName = L"stellaris_mod_loader_probe.txt";
+const wchar_t* kLogName = L"stellaris_mod_injector.log";
+const wchar_t* kIniName = L"stellaris_mod_injector.ini";
 const wchar_t* kProbeFlagName = L"diplo_action_hook_probe_only.txt";
 const char* kVersion = "1.1";
 
@@ -154,7 +152,7 @@ VOID CALLBACK OnTimer(HWND, UINT, UINT_PTR, DWORD) {
 }
 
 // Resolves user32 on demand: importing it would pull it into every host that
-// loads one of the five names, including console tools started from the game
+// loads one of the proxy names, including console tools started from the game
 // folder, and the timer is only useful in hosts that have a message loop.
 bool ArmTimer(unsigned long delay_ms) {
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -196,18 +194,37 @@ DWORD WINAPI Worker(void* how_param) {
   const std::wstring host_path = loader::ModulePath(nullptr);
   const std::wstring game_root = loader::DirectoryOf(host_path);
   const std::wstring mods_dir = game_root + L"\\" + kModsDirName;
-  const bool mods_present = loader::DirExists(mods_dir);
+  bool mods_present = loader::DirExists(mods_dir);
+  bool mods_created = false;
+  DWORD mods_create_error = ERROR_SUCCESS;
+  // The worker runs after start-up. Create the game's mods directory before
+  // opening the log inside it; another proxy may create it at the same time.
+  if (!mods_present && loader::SameName(loader::FileNameOf(host_path), kGameExeName)) {
+    if (CreateDirectoryW(mods_dir.c_str(), nullptr)) {
+      mods_present = true;
+      mods_created = true;
+    } else {
+      mods_create_error = GetLastError();
+      mods_present = loader::DirExists(mods_dir);
+      if (mods_present) mods_create_error = ERROR_SUCCESS;
+    }
+  }
 
-  // The loader's own log lives in the game root, next to the exe the player (and
-  // the launcher) look at, and outside a folder that may not be writable. The
-  // mods keep writing their own logs inside injected_mods.
-  loader::LogInit(game_root + L"\\" + kLogName);
+  loader::LogInit(mods_dir + L"\\" + kLogName);
   loader::Log("stellaris_mod_loader %s -- proxy '%s', pid %lu", kVersion,
               loader::Narrow(self_name).c_str(),
               static_cast<unsigned long>(GetCurrentProcessId()));
   loader::Log("game  : %s", loader::Narrow(host_path).c_str());
   loader::Log("mods  : %s%s", loader::Narrow(mods_dir).c_str(),
               mods_present ? "" : "  (does not exist)");
+  if (mods_created) {
+    loader::Log("created '%s' next to stellaris.exe", loader::Narrow(kModsDirName).c_str());
+  }
+  if (mods_create_error != ERROR_SUCCESS) {
+    // Log also sends to OutputDebugString when the directory is unavailable.
+    loader::Log("could not create mods directory: %s",
+                loader::ErrorText(mods_create_error).c_str());
+  }
 
   // Say what was waited for: the start-up of the game's CRT (when the probe
   // could find it) or the plain 700 ms fallback, and which wake-up brought the
@@ -250,7 +267,17 @@ DWORD WINAPI Worker(void* how_param) {
     return 0;
   }
 
-  const loader::Settings settings = loader::LoadSettings(mods_dir + L"\\" + kIniName);
+  const std::wstring ini_path = mods_dir + L"\\" + kIniName;
+  if (mods_present) {
+    bool ini_created = false;
+    std::string why;
+    if (!loader::EnsureDefaultSettings(ini_path, &ini_created, &why)) {
+      loader::Log("ini   : could not create default settings: %s", why.c_str());
+    } else if (ini_created) {
+      loader::Log("ini   : created default settings at %s", loader::Narrow(ini_path).c_str());
+    }
+  }
+  const loader::Settings settings = loader::LoadSettings(ini_path);
 
   // Same shape as the injector: start the game, wait out its own start-up, then
   // hand it the DLLs. 700 ms is the injector's default and is what was verified
@@ -270,7 +297,7 @@ DWORD WINAPI Worker(void* how_param) {
     Sleep(settings.delay_ms - uptime);
   }
 
-  // A player may install more than one of the five names. The first proxy to get
+  // A player may install more than one proxy name. The first proxy to get
   // here loads; the others walk in behind it and find the modules already in
   // place, which reads as "was already loaded in the process".
   wchar_t mutex_name[64];
@@ -283,9 +310,9 @@ DWORD WINAPI Worker(void* how_param) {
     if (!holding) loader::Log("another proxy DLL holds the loader lock; going ahead anyway");
   }
 
-  const bool probe = mods_present && loader::FileExists(mods_dir + L"\\" + kProbeMarkerName);
+  const bool probe = settings.probe;
   if (probe) {
-    loader::Log("probe mode: creating %s next to every DLL (nothing will be hooked)",
+    loader::Log("probe mode: creating %s next to every loadable DLL (supported mods only)",
                 loader::Narrow(kProbeFlagName).c_str());
   }
 
@@ -297,12 +324,14 @@ DWORD WINAPI Worker(void* how_param) {
         mod.loadable = false;
         mod.why = "this is the loader itself";
       }
-      // The flag has to exist before the DLL's DllMain runs, so it is written
-      // here. A folder that cannot be written to is worth saying out loud: the
-      // mod then hooks for real instead of only reporting addresses.
-      if (mod.loadable && probe && !loader::CreateProbeFlag(path)) {
-        loader::Log("  warning: could not create %s next to %s",
-                    loader::Narrow(kProbeFlagName).c_str(), loader::Narrow(mod.name).c_str());
+      // Set or clear the flag before DllMain runs, so switching probe off also
+      // clears flags left by a previous probe run.
+      if (mod.loadable) {
+        const bool flag_ok = probe ? loader::CreateProbeFlag(path) : loader::RemoveProbeFlag(path);
+        if (!flag_ok) {
+          loader::Log("  warning: could not %s %s next to %s", probe ? "create" : "remove",
+                      loader::Narrow(kProbeFlagName).c_str(), loader::Narrow(mod.name).c_str());
+        }
       }
       candidates.push_back(mod);
     }
@@ -353,7 +382,7 @@ DWORD WINAPI Worker(void* how_param) {
               static_cast<unsigned long>(GetCurrentProcessId()));
   for (const std::string& failure : failures) loader::Log("failed: %s", failure.c_str());
   if (!mods_present) {
-    loader::Log("create '%s' next to stellaris.exe and put the DLLs to load in it",
+    loader::Log("create '%s' next to stellaris.exe and put the DLLs to load in its immediate subdirectories",
                 loader::Narrow(kModsDirName).c_str());
   } else if (loadable == 0) {
     loader::Log("nothing to load");

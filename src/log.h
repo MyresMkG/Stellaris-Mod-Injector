@@ -1,5 +1,5 @@
-// Log file for the proxy loaders. All five builds write the same file in the
-// game root, so a player only has to look in one place. Every start replaces
+// Log file for the proxy loaders. All builds write the same file inside
+// injected_mods, after that directory exists. Every start replaces
 // the file: what is in there is the run that just happened, nothing older.
 #pragma once
 

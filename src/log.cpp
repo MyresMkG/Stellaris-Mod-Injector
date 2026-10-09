@@ -22,7 +22,7 @@ void LogInit(const std::wstring& path) {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_start = GetTickCount();
 
-  // A player may install more than one of the five names, and all of them report
+  // A player may install more than one proxy name, and all of them report
   // into this one file. The first proxy to get here replaces the file, the ones
   // that follow add to it, so the file is still "this run only" without throwing
   // the second proxy's lines away. The name carries the pid, so the next game

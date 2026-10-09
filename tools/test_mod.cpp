@@ -26,6 +26,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (f != nullptr) {
       fprintf(f, "zz_test_mod loaded in pid %lu\n",
               static_cast<unsigned long>(GetCurrentProcessId()));
+      const DWORD flag_attrs = GetFileAttributesW((dir + L"\\diplo_action_hook_probe_only.txt").c_str());
+      fprintf(f, "probe flag: %s\n", flag_attrs != INVALID_FILE_ATTRIBUTES ? "present" : "absent");
       fclose(f);
     }
   }

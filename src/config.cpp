@@ -52,6 +52,39 @@ std::string WithoutBom(const std::string& raw) {
 
 }  // namespace
 
+bool EnsureDefaultSettings(const std::wstring& ini_path, bool* created, std::string* why) {
+  if (created != nullptr) *created = false;
+  // CREATE_NEW prevents one proxy from overwriting another proxy's file, and
+  // never truncates settings the player already has.
+  HANDLE file = CreateFileW(ini_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    const DWORD error = GetLastError();
+    if ((error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) && FileExists(ini_path)) {
+      return true;
+    }
+    if (why != nullptr) *why = ErrorText(error);
+    return false;
+  }
+  const char defaults[] =
+      "# Time in milliseconds from process creation before loading mods.\n"
+      "# Default: 700. Valid range: 1..599999.\n"
+      "delay_ms=700\n"
+      "# Probe mode: 0 = normal hooks (default), 1 = resolve addresses only.\n"
+      "probe=0\n";
+  DWORD written = 0;
+  const DWORD size = static_cast<DWORD>(sizeof(defaults) - 1);
+  const bool ok = WriteFile(file, defaults, size, &written, nullptr) != 0;
+  const DWORD error = ok ? ERROR_WRITE_FAULT : GetLastError();
+  CloseHandle(file);
+  if (!ok || written != size) {
+    if (why != nullptr) *why = ErrorText(error);
+    return false;
+  }
+  if (created != nullptr) *created = true;
+  return true;
+}
+
 Settings LoadSettings(const std::wstring& ini_path) {
   Settings out;
   FILE* f = _wfopen(ini_path.c_str(), L"rb");
@@ -79,6 +112,14 @@ Settings LoadSettings(const std::wstring& ini_path) {
     }
     const std::string key = Trim(line.substr(0, eq));
     const std::string value = Trim(line.substr(eq + 1));
+    if (_stricmp(key.c_str(), "probe") == 0) {
+      if (value == "0" || value == "1") {
+        out.probe = value == "1";
+      } else {
+        Log("ini   : probe '%s' is not 0 or 1; using %u", value.c_str(), out.probe ? 1u : 0u);
+      }
+      continue;
+    }
     if (_stricmp(key.c_str(), "delay_ms") != 0) {
       // A typo here used to be a no-op with nothing in the log to show for it --
       // which is also how a wrong file encoding goes unnoticed.
@@ -98,6 +139,7 @@ Settings LoadSettings(const std::wstring& ini_path) {
   // guessed from the (absent) "waiting" line.
   Log("ini   : %s (delay_ms=%lu)", Narrow(ini_path).c_str(),
       static_cast<unsigned long>(out.delay_ms));
+  Log("ini   : probe=%u", out.probe ? 1u : 0u);
   return out;
 }
 

@@ -16,16 +16,32 @@ std::vector<std::wstring> ListDlls(const std::wstring& dir) {
   HANDLE find = FindFirstFileW(pattern.c_str(), &entry);
   if (find == INVALID_HANDLE_VALUE) return out;
   do {
-    if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+    if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
     const std::wstring name(entry.cFileName);
-    if (name.size() < 4) continue;
-    if (_wcsicmp(name.c_str() + (name.size() - 4), L".dll") != 0) continue;
-    out.push_back(dir + L"\\" + name);
+    if (name == L"." || name == L"..") continue;
+
+    // Only files in immediate child directories are candidates. Do not scan
+    // files in |dir| itself or descend into any of the child's directories.
+    const std::wstring child = dir + L"\\" + name;
+    WIN32_FIND_DATAW file;
+    ZeroMemory(&file, sizeof(file));
+    const std::wstring child_pattern = child + L"\\*";
+    HANDLE child_find = FindFirstFileW(child_pattern.c_str(), &file);
+    if (child_find == INVALID_HANDLE_VALUE) continue;
+    do {
+      if ((file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+      const std::wstring file_name(file.cFileName);
+      if (file_name.size() < 4) continue;
+      if (_wcsicmp(file_name.c_str() + (file_name.size() - 4), L".dll") != 0) continue;
+      out.push_back(child + L"\\" + file_name);
+    } while (FindNextFileW(child_find, &file));
+    FindClose(child_find);
   } while (FindNextFileW(find, &entry));
   FindClose(find);
 
   std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
-    return _wcsicmp(FileNameOf(a).c_str(), FileNameOf(b).c_str()) < 0;
+    const int by_name = _wcsicmp(FileNameOf(a).c_str(), FileNameOf(b).c_str());
+    return by_name != 0 ? by_name < 0 : _wcsicmp(a.c_str(), b.c_str()) < 0;
   });
   return out;
 }
@@ -34,6 +50,14 @@ Mod Inspect(const std::wstring& path) {
   Mod mod;
   mod.path = path;
   mod.name = FileNameOf(path);
+
+  // An empty sibling file disables this DLL before opening or inspecting it.
+  // FileExists excludes directories; appending to the full path also keeps
+  // markers from affecting a DLL with the same name in another mod folder.
+  if (FileExists(path + L"noinject")) {
+    mod.why = "disabled by " + Narrow(mod.name) + "noinject";
+    return mod;
+  }
 
   FILE* f = _wfopen(path.c_str(), L"rb");
   if (f == nullptr) {
@@ -118,6 +142,13 @@ bool CreateProbeFlag(const std::wstring& dll_path) {
   fputs("probe only\n", f);
   fclose(f);
   return true;
+}
+
+bool RemoveProbeFlag(const std::wstring& dll_path) {
+  const std::wstring flag = DirectoryOf(dll_path) + L"\\diplo_action_hook_probe_only.txt";
+  if (DeleteFileW(flag.c_str())) return true;
+  const DWORD error = GetLastError();
+  return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
 }
 
 }  // namespace loader

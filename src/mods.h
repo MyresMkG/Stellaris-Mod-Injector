@@ -1,4 +1,5 @@
-// The DLLs that live in injected_mods, and the checks the injector also runs
+// The DLLs that live in immediate child directories of injected_mods, and the checks
+// the injector also runs
 // before it hands one to the game.
 #pragma once
 
@@ -16,11 +17,12 @@ struct Mod {
   std::string why;  // rejection reason, empty when loadable
 };
 
-// *.dll entries of |dir| in file-name order -- the same order the injector uses,
-// so dynamic keyword registration stays reproducible between the two loaders.
+// *.dll files in immediate child directories of |dir|, in file-name order
+// (full path breaks ties). Excludes |dir|'s own files and deeper directories.
 std::vector<std::wstring> ListDlls(const std::wstring& dir);
 
-// Fills in path/name and runs the injector's PE check (a DLL, x64).
+// Fills in path/name, skips DLLs with a sibling <name>.dllnoinject file, then
+// runs the injector's PE check (a DLL, x64).
 Mod Inspect(const std::wstring& path);
 
 // True when a module with this path is already loaded in this process. The path
@@ -34,5 +36,9 @@ HMODULE Load(const std::wstring& path, std::string* why);
 // injector's --probe flag does -- so diplo_action_hook only resolves addresses
 // and installs nothing.
 bool CreateProbeFlag(const std::wstring& dll_path);
+
+// Removes a previous probe flag so probe=0 takes effect on the next load.
+// A missing flag already satisfies this operation.
+bool RemoveProbeFlag(const std::wstring& dll_path);
 
 }  // namespace loader
