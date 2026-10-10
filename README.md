@@ -6,6 +6,7 @@
 不需要外部工具。
 
 （初版由deepseek-v4.1-flash编写，harness为kimi code）
+
 （新版由gpt-6.1-sol编写，harness为codex）
 
 ---
